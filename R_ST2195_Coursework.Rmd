@@ -1,0 +1,1372 @@
+---
+---
+title: "ST2195_Coursework"
+author: "Zi Lynn Ow"
+date: "15/02/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# ST2195 Coursework
+
+## Loading libraries and data
+
+Load all the libraries needed.
+
+```{r}
+library(tidyverse) 
+library(ggplot2) 
+library(RColorBrewer) 
+library(lubridate)
+library(zoo)
+library(reshape)
+library(igraph)
+library(scales)
+library(dummies)
+library(mlr3)
+library(mlr3learners)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(mlr3viz)
+library(xgboost)
+library(glmnet)
+library(ranger)
+library(janitor)
+library(randomForest)
+library(checkmate)
+```
+
+## Data Wrangling
+
+Download airports.csv, carriers.csv, plane-data.csv, 2006.csv.bz2, and 2007.csv.bz2 from the Harvard dataverse at [\<https://doi.org/10.7910/DVN/HG7NV7\>](https://doi.org/10.7910/DVN/HG7NV7){.uri}. Save the files in a folder called `dataverse_files` . Create data frames called `airports` with airports.csv, `carriers` with carriers.csv, and `planes` with plane-data.csv.
+
+```{r}
+airports <- read.csv("./dataverse_files/airports.csv", header = TRUE)
+carriers <- read.csv("./dataverse_files/carriers.csv", header = TRUE)
+planes <- read.csv("./dataverse_files/plane-data.csv", header = TRUE)
+
+```
+
+Create data frame called `ontime` with 2006.csv.bz2, 2007.csv.bz2.
+
+```{r}
+ontime <- list.files(path = "./dataverse_files", pattern = "*.csv.bz2", full.names = TRUE) %>% 
+lapply(read_csv) %>% bind_rows     
+```
+
+Display the structure and number of rows of `ontime` data frame.
+
+```{r}
+str(ontime)
+nrow(ontime)
+```
+
+In the `ontime` data frame, convert all the column names into lower case. Remove duplicated rows using `distinct()` function. Create a new column called `date` in year-month-day format.
+
+```{r}
+ontime <- ontime %>% rename_all(tolower) %>% distinct()
+ontime$date <- as.Date(with(ontime,paste(year,month,dayofmonth,sep="-")),"%Y-%m-%d")
+```
+
+Convert the actual and scheduled departure and arrival time from 2400 to 0.
+
+```{r}
+ontime  <- ontime  %>% 
+  mutate(deptime = ifelse(deptime ==  2400, 0 , deptime),
+         arrtime = ifelse(arrtime ==  2400, 0 , arrtime),
+         crsdeptime = ifelse(crsdeptime ==  2400, 0 , crsdeptime),
+         crsarrtime = ifelse(crsarrtime ==  2400, 0 , crsarrtime))
+```
+
+Now, exclude all actual and scheduled departure and arrival time more than 2400.
+
+```{r}
+ontime <- subset(ontime, deptime < 2400) 
+ontime <- subset(ontime, arrtime < 2400) 
+ontime <- subset(ontime, crsdeptime < 2400)
+ontime <- subset(ontime, crsarrtime < 2400)
+```
+
+Convert `deptime`, `arrtime`, `crsdeptime` and `crsarrtime` into hours and minutes. If the timing is more than 959, take the first 2 number as hour. For example 1059 is more than 959. The first 2 digits of 10 would be taken as hour. If the timing is less than or equal to 959, the first digit of 9 is assigned as hour. Take last 2 digit as minutes. For example, for 1059 and 959, the last 2 digits of 59 are treated as 59 minutes. Then, unite the hour and minutes with ":" as separator. Concatenate `date` with `deptime`, `arrtime`, `crsdeptime` and `crsarrtime` respectively. Convert them to `POSIXct` object with `as.POSIXct()` function in year-month-day hour:minutes format. The timings are set in EST time zone with the assumption that the data from Harvard Database follows this time zone.
+
+```{r}
+ontime  <- ontime  %>% 
+  mutate(dephour = ifelse(deptime > 959, 
+                        gsub("(^\\d{2}).*", "\\1", deptime),
+                        gsub("(^\\d{1}).*", "\\1", deptime)), 
+         depmin =  deptime %% 100,
+         
+         arrhour = ifelse(arrtime > 959, 
+                        gsub("(^\\d{2}).*", "\\1", arrtime),
+                        gsub("(^\\d{1}).*", "\\1", arrtime)), 
+         arrmin =  arrtime  %% 100,
+         
+         crsdephour = ifelse(crsdeptime > 959,
+                        gsub("(^\\d{2}).*", "\\1", crsdeptime),
+                        gsub("(^\\d{1}).*", "\\1", crsdeptime)),
+         crsdepmin =  crsdeptime %% 100,
+
+         crsarrhour = ifelse(crsarrtime > 959,
+                        gsub("(^\\d{2}).*", "\\1", crsarrtime),
+                        gsub("(^\\d{1}).*", "\\1", crsarrtime)),
+         crsarrmin =  crsarrtime %% 100)
+
+
+ontime <- ontime %>%
+  unite(deptime, dephour , depmin, sep = ":") %>%
+  unite(arrtime, arrhour , arrmin, sep = ":") %>% 
+  unite(crsdeptime, crsdephour , crsdepmin, sep = ":") %>%
+  unite(crsarrtime, crsarrhour , crsarrmin, sep = ":")
+
+
+ontime$datedeptime <- as.POSIXct(paste(ontime$date, ontime$deptime),"%Y-%m-%d %H:%M", tz = "EST")
+
+ontime$datearrtime <- as.POSIXct(paste(ontime$date, ontime$arrtime),"%Y-%m-%d %H:%M", 
+                                 tz = "EST")
+ontime$crsdatedeptime <- as.POSIXct(paste(ontime$date, ontime$crsdeptime),"%Y-%m-%d %H:%M", 
+                                    tz = "EST")
+ontime$crsdatearrtime <- as.POSIXct(paste(ontime$date, ontime$crsarrtime),"%Y-%m-%d %H:%M", 
+                                    tz = "EST")
+```
+
+Divide time into 4-hours intervals and name the intervals as [00:00-04:00), [04:00-08:00), [08:00-12:00) ,[12:00-16:00), [16:00-20:00) , [20:00-24:00). For `arrtimeintervals` , `crsdeptimeintervals` and `crsarrtimeintervals` columns, name of the intervals are assigned as the values. For `crsdeptimeintervals2` and `crsarrtimeintervals2` columns, integer value of 1,2,3,4,5,6 assigned for easier data manipulation later. Drop any non- applicable values in `arrtimeintervals`, `crsdeptimeintervals` and `crsarrtimeintervals` ,`crsdeptimeintervals2` and `crsarrtimeintervals2` columns.
+
+```{r}
+tags <- c("[00:00-04:00)", "[04:00-08:00)","[08:00-12:00)",
+          "[12:00-16:00)","[16:00-20:00)","[20:00-24:00)")
+tags2 <- c(1,2,3,4,5,6)
+
+ontime$arrtimeintervals <- cut(hour(ontime$datearrtime), breaks = seq(0,24,4),
+                             include.lowest = T, right = F, labels = tags)
+ontime$crsdeptimeintervals <- cut(hour(ontime$crsdatedeptime), breaks = seq(0,24,4),
+                             include.lowest = T,right = F, labels = tags)
+ontime$crsarrtimeintervals <- cut(hour(ontime$crsdatearrtime), breaks = seq(0,24,4),
+                             include.lowest = T, right = F, labels = tags)
+ontime$crsdeptimeintervals2 <- cut(hour(ontime$crsdatedeptime), breaks = seq(0,24,4),
+                             include.lowest = T, right = F, labels = tags2)
+ontime$crsarrtimeintervals2 <- cut(hour(ontime$crsdatearrtime), breaks = seq(0,24,4),
+                             include.lowest = T, right = F, labels = tags2)
+
+ontime <- ontime %>% drop_na(arrtimeintervals) %>%
+  drop_na(crsdeptimeintervals) %>% drop_na(crsarrtimeintervals) %>%
+  drop_na(crsdeptimeintervals2) %>% drop_na(crsarrtimeintervals2)
+
+ontime
+```
+
+Create `biarrdelay` columns with value of 1 indicating delay and 0 depicting no delay.
+
+```{r}
+ontime$biarrdelay <- ifelse(ontime$arrdelay > 0, 1,0)
+ontime
+```
+
+Rename the values of `month` and `dayofweek` columns with abbreviation of month and day of week in new columns of `month2` and `dayofweek2` respectively. For instance, value of 1 in `month` column would be named as Jan whereas value of 1 in `dayofweek` column would be indicated as Mon. By stating week_start = 1, `dayofweek` would start on Monday. Add a new column called `week` for nth week of the week with `isoweek()` function.
+
+```{r}
+ontime <- ontime %>% 
+  mutate( month2 = month(date, label = T, abbr = T), 
+          dayofweek2 = wday(date, label = T, abbr = T, week_start = 1),
+          week = isoweek(date))
+ontime
+```
+
+In some cases, the last few days of December might be the 1st week of the following year. Convert 1st week to 53th week. The first few days in January might be the 52nd or 53rd week of the previous year. Convert them to 1st week .
+
+```{r}
+ontime <- mutate(ontime, 
+                 week = case_when(month2 == "Dec" & week == 1 ~ 53,
+                                  month2 == "Jan" & week %in% 52:53 ~ 1,
+                                  T ~ week))
+ontime
+```
+
+## 1. When is the best time of day, day of week and time of the year to fly to minimize delay?
+
+**Idea:** Only arrival delays are considered as departure delay did not necessarily result in arrival delay. Average arrival delays are computed for each date, month, day of week and each time interval to identify the period with shortest average arrival delay to fly to minimize delays.
+
+#### a. Calendar plots for average daily arrival delay for 2006 and 2007
+
+For computation of arrival delay, drop non-applicable arrival delay values in `ontime`. Filter out diverted and canceled flights. When the flight arrives early, it has a negative value. Replace all negative values of `arrdelay` columns with 0 to indicate no delay.
+
+```{r}
+ontime1 <- ontime %>% drop_na(arrdelay) %>% 
+  filter(diverted == 0) %>% 
+  filter(cancelled == 0 ) %>% 
+  mutate(arrdelay = if_else(arrdelay <0, 0, arrdelay)) 
+ontime1
+```
+
+Group by date and compute average daily arrival delay. Remove non-applicable values.
+
+```{r}
+ontime1 <- ontime1 %>% group_by(date) %>% mutate(avgarrdelay= mean(arrdelay, na.rm= T)) 
+ontime1
+```
+
+Use `YlOrRD` color palettes from `RColorBrewer` package to demonstrate the length of daily arrival delay.
+
+```{r}
+YlOrRd <- brewer.pal(n=9, name = "YlOrRd")
+col  <- colorRampPalette(YlOrRd)
+```
+
+Define a function called `theme_calendar` for the visualization of calendar.
+
+```{r}
+theme_calendar <- function() {
+ theme(aspect.ratio = 3/2,
+       axis.title = element_blank(),
+       axis.ticks = element_blank(),
+       axis.text.x = element_blank(),
+       axis.text.y = element_text(family = "sans", size= 7),
+
+       panel.grid = element_blank(),
+       panel.background = element_blank(),
+       panel.spacing = unit(0, "lines"),
+
+       strip.background = element_blank(),
+       strip.text = element_text(family = "sans", face = "bold", size = 10),
+
+       legend.position = "right",
+       legend.key.width = unit(0.2,"cm"),
+       legend.text = element_text(family = "sans", hjust = .5),
+       legend.title = element_text(family = "sans", size = 8, hjust = 1),
+
+       plot.caption =  element_text(family = "sans", hjust = 1, size = 8),
+       panel.border = element_blank(),
+       plot.title = element_text(family = "sans", hjust = .5, size = 10,
+                                 face = "bold"),
+       plot.subtitle = element_text(family = "sans", hjust = .5, size =8)
+ )
+  }
+```
+
+Each rectangle of the calendar represents a day of the year. The color of each rectangle is determined by the length of average daily arrival delays. Shade of dark red demonstrates long average daily arrival delay whereas shade of light yellow depicts short average daily arrival delays. Arrange the x-axis based on week, y-axis based on day of week in inverted manner. Each column is for each distinct month whereas each row is for each distinct year.
+
+Calender plot for arrival delay in 2006 and 2007
+
+```{r}
+ggplot(ontime1, aes(week, dayofweek2, fill = avgarrdelay)) +
+scale_y_discrete(limits = rev) +
+geom_tile(colour = "grey", size = .02) +
+scale_fill_gradient(low = col(1), high = col(9)) + 
+facet_grid(year~ month2, scales = "free") +  
+labs(title = "Average Arrival Delay", subtitle = "from 2006 to 2007", fill = "minutes") + 
+theme_calendar() 
+```
+
+#### b. Bar plots of average monthly arrival delay from 2006 to 2007.
+
+Group by month and calculate average arrival delay for each month. Remove non-applicable values.
+
+```{r}
+avgarrdelaymonthly <- ontime1 %>% group_by(month2) %>% 
+  summarize(monthlyavgarrdelay = mean(arrdelay, na.rm= T))
+avgarrdelaymonthly$monthlyavgarrdelay <- round(avgarrdelaymonthly$monthlyavgarrdelay,digit=2)
+
+avgarrdelaymonthly
+```
+
+Define a function called `theme_generalplot` for the theme of bar plots.
+
+```{r}
+theme_generalplot <- function(){
+  theme(axis.title.x = element_text(family = "sans", hjust = .5, size = 12, face = "bold"),
+        axis.title.y = element_text(family = "sans", hjust = .5, size = 12, face = "bold"),
+        axis.text = element_text(family = "sans", size = 12),
+        
+        legend.position ="none", 
+        
+        plot.caption =  element_text(family = "sans", hjust = 1, size = 12),
+        plot.title = element_text(family = "sans", hjust = .5, size = 15, face = "bold"))
+  }
+```
+
+Generate the bar plots of monthly average arrival delay with `Paired` color palettes from `RColorBrewer`.
+
+```{r}
+ggplot(avgarrdelaymonthly, aes(x= reorder(month2,-monthlyavgarrdelay), 
+                               y= monthlyavgarrdelay, fill=month2)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = monthlyavgarrdelay),family = "sans", vjust = -0.5 , 
+            size = 3, colour = "black", fill = "Month") + 
+  scale_fill_brewer(palette="Paired") +
+  labs(title = "Average Arrival Delay per Month", x = "Month", 
+       y = "Average Arrival Delay (minutes)") +
+  theme_generalplot()
+```
+
+#### c. Bar plots of average arrival delay for day of week from 2006 to 2007.
+
+Group by day of the week and calculate average arrival delay for each day of week. Remove non-applicable values. The days of the week are Monday, Tuesday, Wednesday, Thursday, Friday, Saturday and Sunday.
+
+```{r}
+avgarrdelaydaily <- ontime1 %>% group_by(dayofweek2) %>% 
+  summarize(dailyavgarrdelay = mean(arrdelay, na.rm= T))
+avgarrdelaydaily$dailyavgarrdelay <- round(avgarrdelaydaily$dailyavgarrdelay,digit=2)
+avgarrdelaydaily
+```
+
+Generate the bar plots of average arrival delay for day of week from 2006 to 2007 with `Paired` color palettes from `RColorBrewer` package.
+
+```{r}
+ggplot(avgarrdelaydaily, aes(x= reorder(dayofweek2,-dailyavgarrdelay), y= dailyavgarrdelay, fill=dayofweek2)) +
+  geom_bar(stat="identity", width = 0.65) +
+  geom_text(aes(label = dailyavgarrdelay),family = "sans", 
+            vjust = -0.5 , size = 3, colour = "black") + 
+  scale_fill_brewer(palette="Paired") +
+  labs(title = "Average Arrival Delay per Day of Week", x = "Day of Week",
+       y = "Average Arrival Delay (minutes)", fill = "Day of Week") +
+  theme_generalplot()  
+  
+```
+
+#### d Bar plots of average departure and arrival delays for each time interval from 2006 to 2007.
+
+Group by arrival time intervals and calculate average arrival delay for each time interval. Remove non-applicable values.
+
+```{r}
+avgarrdelaytime <- ontime1 %>% group_by(arrtimeintervals) %>% 
+  summarize(timeavgarrdelay = mean(arrdelay, na.rm= T))
+avgarrdelaytime$timeavgarrdelay <- round(avgarrdelaytime$timeavgarrdelay,digit=2)
+avgarrdelaytime
+```
+
+Generate the bar plots of average arrival delays of each time interval from 2006 to 2007 with `Paired` color palettes from `RColorBrewer` package.
+
+```{r}
+ggplot(avgarrdelaytime,aes(x = reorder(arrtimeintervals,-timeavgarrdelay), 
+                           y = timeavgarrdelay, fill = arrtimeintervals)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(aes(label = timeavgarrdelay),family = "sans", vjust = -0.5 , 
+            size = 2.5, colour = "black") +  
+  scale_fill_brewer(palette="Paired") +
+  labs(title = "Average Arrival Delay per Time Interval", x = "Time Intervals",
+       y = "Average Arrival Delay (minutes)", fill = " Time Intervals") +
+  guides(x = guide_axis(angle = 45)) +
+  theme_generalplot()  
+```
+
+## 2. Do older planes suffer more delays?
+
+**Idea:** Determine age of plane with manufacturing year. Arrival delay ratio for each manufacturing year is computed and plotted with scatter plots fitted with the best fit line. Results from the linear regression model are analyzed to recognize the relationship between manufacturing year and arrival delay ratio.
+
+#### a. Scatter plots for ratios of arrival delays are generated against manufacturing years
+
+The age of the planes is determined by manufacturing year, which is `year` column in `planes` data frame. Rename `year` column as `manufacturingyear`. Convert values in `manufacturingyaer` column to numeric. Drop 0, blanks and "None" in `manufacturingyear` column in `planes` data frame. Inner join planes with `ontime1` where diverted and canceled flights are filtered out from `ontime` by `tailnum` for computation of arrival delay ratio based on manufacturing year.
+
+```{r}
+names(planes)[names(planes) == "year"] <- "manufacturingyear"
+planes$manufacturingyear <- as.numeric(planes$manufacturingyear)
+planes <- planes %>% na_if("") %>% na_if("None") %>% na.omit %>% 
+  filter(manufacturingyear > 0) 
+
+ageofplane <- ontime1 %>% select(depdelay, arrdelay, biarrdelay, tailnum) %>% inner_join(planes, by = "tailnum") 
+ageofplane
+```
+
+Group by manufacturing year and calculate the sum of frequency of no arrival delay and arrival delay.
+
+```{r}
+arrdelayage <- ageofplane %>% group_by(manufacturingyear) %>% 
+  summarise(agearrdelay = sum(biarrdelay != 0)) 
+noarrdelayage <- ageofplane %>% group_by(manufacturingyear) %>% 
+  summarise(noagearrdelay = sum(biarrdelay == 0)) 
+```
+
+Create a new data frame to store the data for sum of frequency of no arrival delay and sum of frequency of arrival delay of each manufacturing year.
+
+```{r}
+carrdelayage <- arrdelayage %>% inner_join(noarrdelayage, by = "manufacturingyear")
+```
+
+Add a new column `sumarrdelay` to sum the numbers of arrival delay and no arrival delay .
+
+```{r}
+carrdelayage$sumarrdelay <- carrdelayage$agearrdelay + carrdelayage$noagearrdelay
+carrdelayage
+```
+
+Add a new column `arrdelayratio` to compute the ratio of arrival delay. Divide the number of arrival delays by sum of arrival and no arrival delay for arrival delay ratio.
+
+```{r}
+carrdelayage <- carrdelayage %>% mutate(arrratio = agearrdelay*1 /sumarrdelay)
+```
+
+Scatter plot of ratio of arrival delays against manufacturing year is plotted. A line of best fit is fitted to demonstrate the relationship between of age of plane and arrival delay ratio.
+
+```{r}
+ggplot(carrdelayage , aes(x=manufacturingyear, y=arrratio)) +
+  geom_point(shape = 1) + 
+  geom_smooth(method=lm, , col= "blue", se = FALSE) +
+  labs(title = "Arrival Delay Ratio based on Age of Planes", 
+       x = "Manufacturing Year", y = "Arrival Delay Ratio") +
+  theme_generalplot()  
+  
+```
+
+#### b. Linear regression for demonstration of the linear relationship between age of plane and ratio of arrival delays.
+
+Identify the linear relationship between age of the plane, indicated by manufacturing year and the ratio of arrival delays. Manufacturing year is the predictor variable whereas arrival delay ratio is the response variable.
+
+```{r}
+lmarrdelayage <- lm(arrratio~manufacturingyear, data = carrdelayage )
+summary(lmarrdelayage)
+```
+
+## 3. How does the number of people flying between different locations change over time?
+
+**Idea:** Investigate how the number of people change monthly from 2006 to 2007 between the destination city with highest number of inbound count and top 10 origin cities with highest number of outbound count to this destination city. This step is repeated with cities with 2nd and 3rd highest inbound count. The number of people is estimated with the number of outbound flights. Each flight is assumed to have 100 people.
+
+\
+To compute the number of people between cities, canceled flights are excluded. To identify the top 3 destination cities with the highest number of inbound counts, destination cities are included in `topinbound`, which is the inner join of `ontime2`, which excluded canceled flights from `ontime` and `airports` by `dest` and `iata` columns. Then, group by destination cities and compute the inbound count for each city. Retain data of the top 3 cities with the highest number of inbound count which are Chicago, Atlanta and Dallas-Fort Worth for `topinbound`.
+
+```{r}
+ontime2 <- ontime %>% filter(cancelled == 0)
+topinbound <- inner_join(ontime2, airports, by = c("dest"="iata"))  %>% group_by(city) %>% 
+  count(city) %>% arrange(desc(n)) %>% head(3)
+
+names(topinbound)[names(topinbound) == "city"] <- "destcity"
+names(topinbound)[names(topinbound) == "n"] <- "inboundcount"
+
+topinbound
+```
+
+`destorigin` is set up for origin and destination data. `ontime2` is joined with airports by `dest` = `iata.` Then, repeat this step with `origin` = `iata`. To ensure that `destorigin` only contains data from top 3 cities with highest inbound count, create `destorigin2` which is the inner join of `destorigin` and `topinbound`. Create a column called `ym`, by concatenating the values from the `year` and `month` columns.
+
+```{r}
+destorigin <- ontime2 %>% 
+  select(datedeptime,datearrtime, year, month, origin, dest, depdelay, 
+         arrdelay, tailnum, biarrdelay) %>% 
+  inner_join(airports, by = c("dest"="iata")) 
+
+names(destorigin)[names(destorigin) == "city"] <- "destcity"
+names(destorigin)[names(destorigin) == "airport"] <- "destairport"
+
+destorigin <- destorigin %>% 
+  inner_join(airports, by = c("origin" = "iata")) %>% 
+  select(datedeptime, datearrtime, year, month, city, destcity, airport, 
+         destairport, depdelay, arrdelay, tailnum, biarrdelay) 
+
+names(destorigin)[names(destorigin) == "city"] <- "origincity"
+names(destorigin)[names(destorigin) == "airport"] <- "originairport"
+
+destorigin2 <- destorigin %>%  inner_join(topinbound, by = "destcity")  
+destorigin2$ym <- as.yearmon(paste(destorigin2$year, destorigin2$month), "%Y %m")
+
+destorigin2
+```
+
+Create data frames `Chicago` ,`Atlanta` , `Dallas` with `ym` , `origin` and `destcity` columns. `Chicago` data frame should only contain data where `destcity` is Chicago, `Atlanta` data frame should only contain data where `destcity` is Atlanta and `Dallas-Fort Worth` data frame should only contain data where `destcity` is Dallas.
+
+```{r}
+for (DESTCITYY in unique(destorigin2$destcity)) { 
+  assign(DESTCITYY, destorigin2  %>% filter(destcity == DESTCITYY) %>%  
+           select(ym, origincity, destcity)) }
+```
+
+To identify the top 10 origin cities with highest outbound count to Chicago, group by origin cities and compute the outbound count of each city. Ensure the destination city of `destorigin` only contains Chicago. This step is repeated for Atlanta and Dallas-Fort Worth with a for loop. The outputs of Chicago with top 10 origin cities, Atlanta with top 10 origin cities and Dallas with top 10 origin cities are stored as 3 new data frames in R with assign() function. The data frames have no `destcity` columns. Merge the data frame with `Chicago`, `Atlanta` and `Dallas` for `destcity` columns.
+
+```{r}
+for (DESTCITYY in unique(destorigin2$destcity)) {
+    assign(paste0("count",DESTCITYY), 
+         destorigin2  %>% filter(destcity == DESTCITYY) %>% 
+         select(ym, origincity, destcity) %>% group_by(origincity) %>% 
+         summarise(outboundcount =n()) %>% arrange(desc(outboundcount)) %>% head(10))
+}
+
+Chicago2 <- Chicago %>% inner_join(countChicago) %>% arrange(desc(outboundcount))
+Atlanta2 <- Atlanta %>% inner_join(countAtlanta) %>% arrange(desc(outboundcount))
+Dallas2 <- `Dallas-Fort Worth` %>% inner_join(`countDallas-Fort Worth`) %>%
+  arrange(desc(outboundcount))
+```
+
+Then, bind the 3 data frames by row as `topdestorigin`. To identify the monthly outbound count of each 10 origin cities to Chicago, group by origin cities and `ym` for the computation of outbound count. Ensure the destination city of `topdestorigin` only contains Chicago.  This step is repeated with another 2 cities with a for loop in R.
+
+```{r}
+topdestorigin <- rbind(Chicago2, Atlanta2, Dallas2)
+for (DESTCITYY in unique(topdestorigin$destcity)) {
+    assign(paste0(DESTCITYY,"3"), 
+         topdestorigin  %>% filter(destcity == DESTCITYY) %>% 
+           group_by(origincity,ym) %>% 
+           mutate(outboundcount =n()) %>% distinct())
+}
+```
+
+Bind the 3 data frames by row as `topdestorigin`.The outbound count is then multiplied by 100 to represent the number of people.
+
+```{r}
+topdestorigin <- rbind(Chicago3, Atlanta3, `Dallas-Fort Worth3`)
+for (DESTCITYY in unique(topdestorigin$destcity)) {
+    assign(paste0(DESTCITYY,"4"), 
+         topdestorigin  %>% filter(destcity == DESTCITYY) %>% 
+           mutate(peoplecount = outboundcount*100) )
+}
+```
+
+The output is then stored in `topdestorigin`. Plot a heat map to depicts the number of people of each month of the year flying from top 10 origin cities to Chicago, Atlanta and Dallas-Fort Worth respectively from 2006 to 2007. Each rectangle demonstrates the number of people. `YlGn` color palettes from `RColorBrewer` package is chosen for the heat map. Dark green represent higher number of people whereas light yellow illustrates lower number of people.
+
+```{r}
+topdestorigin <- rbind(Chicago4, Atlanta4, `Dallas-Fort Worth4`)
+YlGn <-brewer.pal(n = 9, name = "YlGn")
+col2 <- colorRampPalette(YlGn)
+
+peopleheatmap <- function(DESTCITYY){
+  topdestorigin2 <- topdestorigin %>% filter(destcity == DESTCITYY)
+  ggplot(topdestorigin2, col2 = col2, mapping = aes(x = ym, 
+                                                    y = reorder(origincity,peoplecount), 
+                                                    fill = peoplecount)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient(low = col2(1), high = col2(9)) +
+    scale_x_continuous(breaks=as.numeric(topdestorigin2$ym), 
+                   labels=format(topdestorigin2$ym,"%b %y")) +
+    labs(title = "Number of people from origin cities from 2006 to 2007 to",
+         subtitle = DESTCITYY, x = "Period", y = "Origin Cities", 
+         fill = "Number0\nof\nPeople") +
+    theme(panel.background = element_blank(),
+      plot.background = element_blank(),
+      plot.title = element_text(family = "sans", hjust = .5, size = 10, face = "bold"),
+      plot.subtitle = element_text(family = "sans", hjust = .5, size = 10),
+      axis.text.x = element_text(family = "sans", size = 11, angle=90, hjust=1),
+      axis.text.y = element_text(family = "sans", size = 11, angle= 0, hjust=1),
+      axis.ticks = element_blank(),
+      legend.text = element_text(family = "sans", size = 10,  hjust = 0),
+      legend.title = element_text(family = "sans", size = 10, vjust = .5, face = "bold"),
+      legend.position = "right",
+      legend.key.width = unit(0.5, "cm"))
+}
+
+```
+
+A for loop is used to plot heat maps for number of people to Chicago, Atlanta and Dallas.
+
+```{r}
+for (DESTCITYY in unique(topdestorigin$destcity)){
+
+  plot(peopleheatmap(DESTCITYY))
+
+}
+```
+
+## 4. Can you detect cascading failures as delays in one airport create delays in others?
+
+**Idea:** Study how departure delay of planes from an airport led to cascading arrival and departure delays of planes to other airports on the day where average arrival delay is the longest.
+
+To identify cascading failures, canceled and diverted flights are excluded. For origin and destination airports data, `destorigin3` is set up. Join `ontime1` from `ontime` which excludes canceled and diverted flights with `airports` by `dest`= `iata`. Then, repeat this step with `origin` = `iata`.
+
+```{r}
+destorigin3 <- ontime1 %>% 
+  select(datedeptime,datearrtime,crsdatedeptime,crsdatearrtime, date,
+         year, month, origin, dest, depdelay, 
+         arrdelay, tailnum, flightnum, biarrdelay) %>% 
+  inner_join(airports, by = c("dest"="iata")) 
+
+names(destorigin3)[names(destorigin3) == "city"] <- "destcity"
+names(destorigin3)[names(destorigin3) == "airport"] <- "destairport"
+
+destorigin3 <- destorigin3 %>% 
+  inner_join(airports, by = c("origin" = "iata")) %>% 
+  select(datedeptime, datearrtime, crsdatedeptime,crsdatearrtime,date,
+         year, month, city, destcity, airport,    
+         destairport, depdelay, arrdelay, tailnum, flightnum, biarrdelay) 
+
+names(destorigin3)[names(destorigin3) == "city"] <- "origincity"
+names(destorigin3)[names(destorigin3) == "airport"] <- "originairport"
+```
+
+To identify the date with longest average arrival delay.
+
+```{r}
+maxdelaydate <-ontime1 %>% filter(avgarrdelay == max(ontime1$avgarrdelay)) %>% distinct(date)
+maxdelaydate
+```
+
+Ensure that `destorigin4` only contains the data from the date with the longest average arrival delay, which is on 2006-01-02. Arrange the data by tail number and actual departure time in ascending order. Ensure that arrival time is later than departure time, departure time is later than previous arrival time.
+
+```{r}
+destorigin4 <- destorigin3 %>% filter(date == maxdelaydate$date) %>% 
+  select(date, tailnum, flightnum, crsdatedeptime,  crsdatearrtime,datedeptime, datearrtime, 
+         originairport, destairport, depdelay, arrdelay) %>%
+  arrange(tailnum, datedeptime) %>%
+  filter(datearrtime > datedeptime) %>%
+  mutate(lagdatearrtime = lag(datearrtime)) %>%
+  filter(datedeptime > lagdatearrtime)
+destorigin4
+```
+
+Select top 6 planes with highest number of flights on 2006-01-02. The top plane has 13 flights whereas the 2nd to 6th planes have 12 flights.
+
+```{r}
+destorigin5 <- destorigin4 %>% group_by(tailnum) %>% summarise(frequency = n()) %>%
+  arrange(desc(frequency)) %>% distinct(tailnum,.keep_all =T) %>% head(6)
+destorigin5
+```
+
+Select data with only the top 6 planes.
+
+```{r}
+toptailnum <- destorigin4 %>% inner_join(destorigin5) 
+toptailnum <- tibble::rowid_to_column(toptailnum, "index")
+toptailnum
+```
+
+Filter the data such that only data with departure and arrival delay are selected.
+
+```{r}
+toptailnum2 <- toptailnum %>% filter(depdelay > 0) %>% filter(arrdelay > 0)
+toptailnum2
+```
+
+Create data frames for original data and other data frames for data with departure and arrival delay.
+
+```{r}
+for (NUM in unique(toptailnum$tailnum)) {
+    assign(paste0(NUM,"_1"), 
+         toptailnum  %>% filter(tailnum == NUM))
+}
+
+for (NUM in unique(toptailnum2$tailnum)) {
+    assign(paste0(NUM,"_2"), 
+         toptailnum2  %>% filter(tailnum == NUM))
+    print(NUM)
+}
+```
+
+To study flights with cascading departure and arrival delay, compare the index of original data frames with filtered data frame and remove all rows below if there are missing index in the middle of the data frames. Row with missing index implies that plane did not have delay for that timing, hence breaking the cascading effect. The missing indexes are not in the middle of the data frames. Hence, no rows are needed to be removed.
+
+```{r}
+anti_join(N226SW_1, N226SW_2)
+anti_join(N271YV_1, N271YV_2)
+anti_join(N480HA_1, N480HA_2)
+```
+
+N226SW had more than 3 consecutive departure and arrival delays respectively.
+
+```{r}
+N226SW_2 <- N226SW_2 %>% select(tailnum,flightnum,crsdatedeptime,datedeptime,
+                                crsdatearrtime, datearrtime, originairport,
+                                destairport, date) 
+rownames(N226SW_2) <- 1:nrow(N226SW_2)                      
+N226SW_2
+```
+
+N271YV had more than 3 consecutive departure and arrival delays respectively.
+
+```{r}
+N271YV_2 <- N271YV_2  %>% select(tailnum,flightnum,crsdatedeptime,datedeptime,
+                                crsdatearrtime, datearrtime, originairport,
+                                destairport, date) 
+
+rownames(N271YV_2) <- 1:nrow(N271YV_2)
+N271YV_2 
+
+```
+
+N480HA has less than 3 consecutive departure and arrival delays respectively. Hence, it is not selected for the study of cascading failure.
+
+```{r}
+N480HA_2 <- N480HA_2 %>% select(tailnum,flightnum,crsdatedeptime,datedeptime,
+                                crsdatearrtime, datearrtime, originairport,
+                                destairport, date) 
+
+rownames(N480HA_2) <- 1:nrow(N480HA_2)
+N480HA_2
+```
+
+Create a directed graph for cascading failures of N271YV on 2006-01-02.
+
+```{r}
+links1 <- N271YV_2 %>% ungroup() %>% select(originairport, destairport)
+
+# Turn it into igraph object
+network1a <- graph_from_data_frame(d=links1, directed=T) 
+ 
+# Count the number of degree for each node:
+deg <- degree(network1a, mode="all")
+
+# simplified network
+network1b = simplify(network1a) 
+
+# Count the number of edges between 2 nodes
+E(network1b)$weight = sapply(E(network1b), function(e) { 
+    length(all_shortest_paths(network1a, from=ends(network1b, e)[1], to=ends(network1b, e)[2])$res) })
+
+
+plot(network1b, layout = layout.kamada.kawai, vertex.size = deg*5, 
+     vertex.label.color= "black", vertex.color= "#fecc5c", edge.width = E(network1b)$weight*3,
+     edge.arrow.size = 1,  edge.curved =T)
+
+title("\n\nCascading failures of N271YV on 2006-01-02",cex.main = 1.2, col.main="black")
+```
+
+Create a directed graph for cascading failures of N226SW on 2006-01-02.
+
+```{r}
+links2 <- N226SW_2 %>% ungroup() %>% select(originairport, destairport)
+
+# Turn it into igraph object
+network2a <- graph_from_data_frame(d=links2, directed=T) 
+ 
+# Count the number of degree for each node:
+deg <- degree(network2a, mode="all")
+
+# simplified network
+network2b = simplify(network2a) 
+
+# Count the number of edges between 2 nodes
+E(network2b)$weight = sapply(E(network2b), function(e) { 
+    length(all_shortest_paths(network2a, from=ends(network2b, e)[1], to=ends(network2b, e)[2])$res) })
+
+
+plot(network2b, layout = layout.kamada.kawai, vertex.size = deg*5, 
+     vertex.label.color= "black", vertex.color= "#f03b20", edge.width = E(network2b)$weight*3,
+     edge.arrow.size = 1,  edge.curved =T)
+
+title("\n\nCascading failures of N226SW on 2006-01-02",cex.main = 1.2, col.main="black")
+
+
+```
+
+## 5. Use available variables to construct a model that predicts delays
+
+**Idea:** A target variable is chosen and exploratory data analysis is conducted for features selection. Data is sampled to process datasets. Different classification models are trained with training sets and their performance is evaluated by running the trained models on test sets. Grid search with cross validations are conducted using training set for hyperparameter optimisation. Classification error is used as a measure to compare performance of the classification models.
+
+### a. Exploratory data analysis
+
+Explore the relationship between scheduled departure time and arrival delay ratio. Compute arrival delay ratio for each scheduled departure time interval.
+
+```{r}
+arrdeptimedelay <- ontime1 %>% group_by(crsdeptimeintervals) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarrdeptimedelay <- ontime1 %>% group_by(crsdeptimeintervals) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carrdeptimedelay <- arrdeptimedelay %>% inner_join(noarrdeptimedelay,
+                                                   by = "crsdeptimeintervals")
+carrdeptimedelay$sumarrdelay <- carrdeptimedelay$arrdelay + carrdeptimedelay$noarrdelay
+
+carrdeptimedelay <- carrdeptimedelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carrdeptimedelay$arrratio <- round(carrdeptimedelay$arrratio,digit = 2)
+carrdeptimedelay <- carrdeptimedelay %>% arrange(desc(arrratio)) 
+```
+
+```{r}
+ggplot(carrdeptimedelay, aes(x= reorder(crsdeptimeintervals,-arrratio), 
+                             y=arrratio, fill=crsdeptimeintervals)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 3, colour = "black") +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 45)) +
+  ylim(0,0.58) +
+  #scale_x_discrete(labels = tags) +
+  labs(title = "Arrival Delay Ratio based on\nScheduled Departure Time Intervals", 
+       x = "Scheduled Departure Time Intervals",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+Explore the relationship between scheduled arrival time and arrival delay ratio. Compute arrival delay ratio for each scheduled arrival time interval.
+
+```{r}
+arrarrtimedelay <- ontime1 %>% group_by(crsarrtimeintervals) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarrarrtimedelay <- ontime1 %>% group_by(crsarrtimeintervals) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carrarrtimedelay <- arrarrtimedelay %>% inner_join(noarrarrtimedelay,
+                                                   by = "crsarrtimeintervals")
+carrarrtimedelay$sumarrdelay <- carrarrtimedelay$arrdelay + carrarrtimedelay$noarrdelay
+
+carrarrtimedelay <- carrarrtimedelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carrarrtimedelay$arrratio <- round(carrarrtimedelay$arrratio,digit = 2)
+carrarrtimedelay <- carrarrtimedelay %>% arrange(desc(arrratio)) 
+```
+
+```{r}
+ggplot(carrarrtimedelay, aes(x= reorder(crsarrtimeintervals,-arrratio), 
+                             y=arrratio, fill=crsarrtimeintervals)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 3, colour = "black") +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 45)) +
+  #scale_x_discrete(labels = tags) +
+  labs(title = "Arrival Delay Ratio based on\nScheduled Arrival Time Intervals", 
+       x = "Scheduled Departure Time Intervals",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+Explore the relationship between carrier and arrival delay ratio. Compute arrival delay ratio for each carrier.
+
+```{r}
+carriers <- carriers %>% rename_all(tolower)
+arrcarrierdelay <- ontime1 %>% 
+  inner_join(carriers, by = c("uniquecarrier" = "code"))
+arrcarrierdelay <- arrcarrierdelay %>% group_by(description) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarrcarrierdelay <- ontime1 %>% 
+  inner_join(carriers, by = c("uniquecarrier" = "code")) 
+noarrcarrierdelay <- noarrcarrierdelay %>% group_by(description) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carrcarrierdelay <- arrcarrierdelay %>% inner_join(noarrcarrierdelay, by = "description")
+carrcarrierdelay$sumarrdelay <- carrcarrierdelay$arrdelay + carrcarrierdelay$noarrdelay
+
+carrcarrierdelay <- carrcarrierdelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carrcarrierdelay$arrratio <- round(carrcarrierdelay$arrratio,digit = 3)
+carrcarrierdelay <- carrcarrierdelay %>% arrange(desc(arrratio)) %>%  head(10)
+
+```
+
+```{r}
+ggplot(carrcarrierdelay, aes(x= reorder(description,-arrratio), 
+                             y=arrratio, fill=description)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 2.5, colour = "black") +
+  scale_x_discrete(labels = c("ATA Airlines","Atlantic Southeast Airlines",
+                              "Northwest Airlines Inc."," US Airways Inc.",
+                              "Comair Inc.","Alaska Airlines Inc.",
+                              "Frontier Airlines Inc.","American Airlines",
+                              "Continental Air Lines Inc","American eagle Airlines")) +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 45)) +
+  labs(title = "Arrival Delay Ratio based on Carriers", x = "Carriers",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+Explore the relationship between destination airport and arrival delay ratio. Compute arrival delay ratio for each destination airport.
+
+```{r}
+arrdestairportdelay <- destorigin3 %>% group_by(destairport) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarrdestairportdelay <- destorigin3 %>% group_by(destairport) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carrdestairportdelay <- arrdestairportdelay %>% inner_join(noarrdestairportdelay,
+                                                   by = "destairport")
+carrdestairportdelay$sumarrdelay <- carrdestairportdelay$arrdelay + carrdestairportdelay$noarrdelay
+
+carrdestairportdelay <- carrdestairportdelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carrdestairportdelay$arrratio <- round(carrdestairportdelay$arrratio,digit = 3)
+carrdestairportdelay <- carrdestairportdelay %>% arrange(desc(arrratio)) %>% head(10)
+```
+
+```{r}
+ggplot(carrdestairportdelay, aes(x= reorder(destairport,-arrratio), 
+                             y=arrratio, fill=destairport)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 2.5, colour = "black") +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 45)) +
+  labs(title = "Arrival Delay Ratio based on Destination Airports",
+       x = "Destination Airports",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+Explore the relationship between origin airport and arrival delay ratio. Compute arrival delay ratio for each origin airport.
+
+```{r}
+arroriginairportdelay <- destorigin3 %>% group_by(originairport) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarroriginairportdelay <- destorigin3 %>% group_by(originairport) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carroriginairportdelay <- arroriginairportdelay %>% inner_join(noarroriginairportdelay,
+                                                   by = "originairport")
+carroriginairportdelay$sumarrdelay <- carroriginairportdelay$arrdelay + carroriginairportdelay$noarrdelay
+
+carroriginairportdelay <- carroriginairportdelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carroriginairportdelay$arrratio <- round(carroriginairportdelay$arrratio,digit = 3)
+carroriginairportdelay <- carroriginairportdelay %>% arrange(desc(arrratio)) %>% head(10)
+```
+
+```{r}
+ggplot(carroriginairportdelay, aes(x= reorder(originairport,-arrratio), 
+                             y=arrratio, fill=originairport)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 2.5, colour = "black") +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 45)) +
+  labs(title = "Arrival Delay Ratio based on Origin Airports",
+       x = "Origin Airports",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+Explore the relationship between month and arrival delay ratio. Compute arrival delay ratio for each month.
+
+```{r}
+arrmonthdelay <- ontime1 %>% group_by(month2) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarrmonthdelay <- ontime1 %>% group_by(month2) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carrmonthdelay <- arrmonthdelay %>% inner_join(noarrmonthdelay,
+                                                   by = "month2")
+carrmonthdelay$sumarrdelay <- carrmonthdelay$arrdelay + carrmonthdelay$noarrdelay
+
+carrmonthdelay <- carrmonthdelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carrmonthdelay$arrratio <- round(carrmonthdelay$arrratio,digit = 3)
+carrmonthdelay <- carrmonthdelay %>% arrange(desc(arrratio)) 
+```
+
+```{r}
+ggplot(carrmonthdelay, aes(x= reorder(month2,-arrratio), 
+                             y=arrratio, fill = month2)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 3, colour = "black") +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 0)) +
+  #scale_x_discrete(labels = tags) +
+  labs(title = "Arrival Delay Ratio based on Month", 
+       x = "Month",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+Explore the relationship between day of week and arrival delay ratio. Compute arrival delay ratio for each day of week.
+
+```{r}
+arrdaydelay <- ontime1 %>% group_by(dayofweek2) %>%
+  summarise(arrdelay = sum(biarrdelay != 0)) 
+
+noarrdaydelay <- ontime1 %>% group_by(dayofweek2) %>%
+  summarise(noarrdelay = sum(biarrdelay == 0)) 
+
+carrdaydelay <- arrdaydelay %>% inner_join(noarrdaydelay,
+                                                   by = "dayofweek2")
+carrdaydelay$sumarrdelay <- carrdaydelay$arrdelay + carrdaydelay$noarrdelay
+
+carrdaydelay <- carrdaydelay %>% mutate(arrratio = arrdelay*1 /sumarrdelay)
+carrdaydelay$arrratio <- round(carrdaydelay$arrratio,digit = 3)
+carrdaydelay <- carrdaydelay %>% arrange(desc(arrratio)) 
+```
+
+```{r}
+ggplot(carrdaydelay, aes(x= reorder(dayofweek2,-arrratio), 
+                             y=arrratio, fill = dayofweek2)) +
+  geom_bar(stat="identity", width = 0.75) +
+  geom_text(aes(label = arrratio),family = "sans",
+            vjust = -0.5 , size = 3, colour = "black") +
+  scale_fill_brewer(palette="Paired") +
+  guides(x = guide_axis(angle = 0)) +
+  #scale_x_discrete(labels = tags) +
+  labs(title = "Arrival Delay Ratio based on Day of Week", 
+       x = "Day of Week",
+       y = "Arrival Delay Ratio") +
+  theme_generalplot()
+```
+
+### b. Target variable and features selection
+
+The target variable is `biarrdelay`. If the arrival delay, `arrdelay` is more than 0, `biarrdelay` = 1. Else, `biarrdelay` = 0. Based on exploratory data analysis, the features such as `crsdeptimeintervals`, `crsarrtimeintervals`, `carrier`, `destairport`, `originairport`, `month`,`dayofweek` are chosen as they have influence on the outcome of `biarrdelay`.
+
+A data frame, `ontime3` is set up by filtering out canceled and diverted flights from `ontime` and containing all the features and target variable needed for predictive modelling.
+
+```{r}
+ontime3 <- ontime %>% filter(cancelled == 0) %>% filter(diverted == 0) %>%
+  inner_join(airports, by = c("dest"="iata")) %>%
+  inner_join(carriers, by = c("uniquecarrier" = "code")) %>%
+  select(biarrdelay, crsdeptimeintervals, crsarrtimeintervals,
+                crsdeptimeintervals2, crsarrtimeintervals2, description, 
+                airport, month, dayofweek, month2, dayofweek2, origin)
+names(ontime3)[names(ontime3) == "airport"] <- "destairport"
+names(ontime3)[names(ontime3) == "description"] <- "carrier"
+
+ontime3 <- ontime3 %>% 
+  inner_join(airports, by = c("origin"="iata")) %>%
+  select(biarrdelay, crsdeptimeintervals, crsarrtimeintervals,
+        crsdeptimeintervals2, crsarrtimeintervals2, carrier, 
+        airport,destairport, month, dayofweek, month2, dayofweek2)
+names(ontime3)[names(ontime3) == "airport"] <- "originairport"
+ontime3
+```
+
+Based on summary of the data, `ontime3` is free of non-applicable values.
+
+```{r}
+summary(ontime3)
+```
+
+### c. Sampled data from original data
+
+The data from 2006 to 2007 of approximately 14 million rows. 20% of the data is sampled such that the distribution of the all variables of the sampled data is the same with original data.
+
+```{r}
+numberofrow <- nrow(ontime3)
+set.seed(12)
+ontime4 <- sample.int(
+  n = nrow(ontime3),
+  size = 0.2*numberofrow,
+  replace = FALSE
+)
+ontime4 <- ontime3[ontime4,]
+```
+
+Add new column in `ontime3` and `ontime4` with character "original" and "sample" respectively. Bind them by rows.
+
+```{r}
+ontime3$char <- "original"
+ontime4$char <- "sample"
+combined <- rbind(ontime3, ontime4)
+```
+
+Define a function called `theme_stacked` for the theme of stacked bar plots.
+
+```{r}
+theme_stacked <- function(){
+  theme(legend.position = "bottom",
+        legend.title = element_text(family = "sans", size = 12, hjust = 1),
+        legend.text = element_text(family = "sans", size = 12, hjust = .5),
+  
+        axis.title.x = element_text(family = "sans", hjust = .5, size = 12, face = "bold"),
+        axis.title.y = element_text(family = "sans", hjust = .5, size = 12, face = "bold"),
+        axis.text = element_text(family = "sans", size = 12),
+        
+        plot.title = element_text(family = "sans", hjust = .5, size = 15, face = "bold"))
+}
+```
+
+Plot the distribution of original versus sampled data for scheduled departure time intervals.
+
+```{r}
+combined %>%
+  ggplot(aes(x = factor(crsdeptimeintervals), fill = char)) +
+    stat_count(width = 0.5, alpha = 1)+
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Scheduled Departure Time Intervals", y = "Count", fill = "Original or Sampled") + 
+    guides(x = guide_axis(angle = 45)) +
+    theme_stacked() 
+
+```
+
+Plot the distribution of original versus sampled data for scheduled arrival time intervals.
+
+```{r}
+combined %>%
+  ggplot(aes(x = factor(crsarrtimeintervals), fill = char)) +
+    stat_count(width = 0.5, alpha = 1)+
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Scheduled Arrival Time Intervals", y = "Count", fill = "Original or Sampled") +
+  guides(x = guide_axis(angle = 45)) +
+  theme_stacked() 
+```
+
+Plot the distribution of original versus sampled data for destination airport.
+
+```{r}
+combined %>%
+  ggplot(aes(x = destairport, fill = char)) +
+    stat_count(width = 0.5, alpha = 1)+
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Destination Airports", y = "Count", fill = "Original or Sampled") + 
+    theme_stacked() + 
+    theme( axis.text.x = element_blank(), axis.ticks = element_blank())
+```
+
+Plot the distribution of original versus sampled data for origin airport.
+
+```{r}
+combined %>%
+  ggplot(aes(x = originairport, fill = char)) +
+    stat_count(width = 0.5, alpha = 1)+
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Origin Airports", y = "Count", fill = "Original or Sampled") + 
+    theme_stacked() + 
+    theme( axis.text.x = element_blank(), axis.ticks = element_blank())
+```
+
+Plot the distribution of original versus sampled data for carrier.
+
+```{r}
+combined %>%
+  ggplot(aes(x = carrier, fill = char)) +
+    stat_count(width = 0.5, alpha = 1)+
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Carrier", y = "Count", fill = "Original or Sampled") + 
+    theme_stacked() + 
+    theme( axis.text.x = element_blank(), axis.ticks = element_blank())
+    
+```
+
+Plot the distribution of original versus sampled data for month.
+
+```{r}
+combined %>%
+  ggplot(aes(x = factor(month2), fill = char)) +
+    stat_count(width = 0.5, alpha = 1)+
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Month", y = "Count", fill = "Original or Sampled") + 
+    theme_stacked() 
+```
+
+Plot the distribution of original versus sampled data for day of week.
+
+```{r}
+combined %>%
+  ggplot(aes(x = factor(dayofweek2), fill = char)) +
+    stat_count(width = 0.5, alpha = 1) +
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Day of Week", y = "Count", fill = "Original or Sampled") + 
+    theme_stacked() 
+```
+
+Plot the distribution of original versus sampled data for arrival delay.
+
+```{r}
+combined %>%
+  ggplot(aes(x = biarrdelay, fill = char)) +
+    stat_count(width = 0.5, alpha = 1) +
+    scale_fill_brewer(palette="Paired") +
+    labs(title = "Distribution of Original versus Sampled Data", 
+       x = "Arrival Delay", y = "Count", fill = "Original or Sampled") + 
+    theme_stacked() 
+```
+
+### d. Pre-processing for predictive modelling
+
+Convert categorical variables to dummy variables. Multicollinearity issues could be avoided by removing the last dummy of every variables.
+
+```{r}
+ontime4 <- cbind(ontime4, dummy(ontime4$carrier, sep = "_"))
+ontime4 <- ontime4[1:(length(ontime4)-1)]
+ontime4 <- cbind(ontime4, dummy(ontime4$destairport, sep = "_"))
+ontime4 <- ontime4[1:(length(ontime4)-1)]
+ontime4 <- cbind(ontime4, dummy(ontime4$originairport, sep = "_"))
+ontime4 <- ontime4[1:(length(ontime4)-1)]
+ontime4 <- ontime4 %>% dplyr::select(-c(carrier, destairport, originairport))
+```
+
+Clean the column names.
+
+```{r}
+ontime4 <- ontime4 %>% clean_names()
+```
+
+Convert to ordered or non-ordered factors
+
+```{r}
+ontime4$crsdeptimeintervals2 <- factor(ontime4$crsdeptimeintervals2, order=TRUE, 
+                                    levels = c(1,2,3,4,5,6))
+
+ontime4$crsarrtimeintervals2 <- factor(ontime4$crsarrtimeintervals2, order=TRUE, 
+                                    levels = c(1,2,3,4,5,6))
+
+ontime4$month <- factor(ontime4$month, order=TRUE, 
+                                    levels = c(1,2,3,4,5,6,7,8,9,10,11,12))
+
+ontime4$dayofweek <- factor(ontime4$dayofweek, order=TRUE, 
+                                    levels = c(1,2,3,4,5,6,7))
+
+ontime4$biarrdelay <- factor(ontime4$biarrdelay)
+
+```
+
+Remove columns that are not needed.
+
+```{r}
+ontime4 <- ontime4 %>% select(-crsdeptimeintervals, -crsarrtimeintervals,
+                              -month2, -dayofweek2, -char)
+```
+
+Convert to factors.
+
+```{r}
+index <- 6:ncol(ontime4)
+ontime4[index] <- lapply(ontime4[,index], as.factor)
+```
+
+For non-ordered factors, remove first factor level, leaving n-1 columns using method = "treatment" .For ordered factors, convert the ordered factors to integer.
+
+```{r}
+fencoder <- po("encode", method ="treatment",
+               affect_columns=selector_type("factor"))
+
+# Change ordered to integer
+ordtoint <- po("colapply", applicator = as.integer,
+                 affect_columns=selector_type("ordered"))
+```
+
+From the sampled data, 75% of the data are selected randomly as training set and the rest for test set.
+
+```{r}
+n2 <- nrow(ontime4)
+set.seed(100)
+trainset <- sample(n2, round(0.75*n2))
+testset <- setdiff(1:n2, trainset)
+```
+
+Select `classif.ce` as a measure for classification error.
+
+```{r}
+measure <- msr("classif.ce")
+```
+
+Use grid search to identify hyperparameters of each model for most accurate predictions. The number of evaluations is set to run for a maximum of 20 times.
+
+```{r}
+tuner <- tnr('grid_search')
+terminator <- trm('evals', n_evals = 20)
+```
+
+Select `biarrdelay` as the target and `crsdeptimeintervals`, `crsarrtimeintervals`, `carrier`, `destairport`, `originairport`, `month`, and `dayofweek` as the features. Use `TaskClassif` as it is a classification task.
+
+```{r}
+task <- TaskClassif$new("ontime4", backend= ontime4, target = "biarrdelay")
+task$select(setdiff(task$feature_names, "biarrdelay"))
+task
+```
+
+### e. Classification models
+
+Logistic regression
+
+```{r}
+learnerlr <- lrn("classif.log_reg")
+gclr <- fencoder %>>%  ordtoint %>>% po('scale') %>>%
+  po(learnerlr)
+glrnlr <- GraphLearner$new(gclr)
+
+glrnlr$train(task, row_ids=trainset)
+glrnlr$predict(task, row_ids=testset)$score()
+```
+
+Penalised logistic regression
+
+```{r}
+learnerplr <- lrn('classif.glmnet')
+
+gcplr <- fencoder %>>% ordtoint %>>%
+  po('scale') %>>%
+  po(learnerplr)
+
+glrnplr <- GraphLearner$new(gcplr)
+
+tunelambda <- ParamSet$new(list(ParamDbl$new('classif.glmnet.lambda',
+                                             lower=0.001, upper=2)))
+
+atplr <- AutoTuner$new(
+learner = glrnplr,
+resampling = rsmp('cv', folds=3),
+measure = measure,
+search_space = tunelambda,
+ terminator = terminator,
+tuner = tuner
+)
+
+atplr$train(task, row_ids = trainset)
+atplr$predict(task, row_ids = testset)$score()
+```
+
+Gradient boosting
+
+```{r}
+learnergb <- lrn("classif.xgboost")
+
+gcgb <- fencoder %>>% ordtoint %>>%
+  po(learnergb)
+
+glrngb <- GraphLearner$new(gcgb)
+
+glrngb$train(task, row_ids = trainset)
+glrngb$predict(task, row_ids = testset)$score() 
+```
+
+Classification tree
+
+```{r}
+learnertree <- lrn("classif.rpart")
+
+learnertree$train(task, row_ids = trainset)
+learnertree$predict(task, row_ids = testset)$score()
+```
+
+Random forest
+
+```{r}
+set.seed(10)
+learnerrf <- lrn('classif.ranger') 
+learnerrf$param_set$values <- list(min.node.size=4)
+
+tunentrees <- ParamSet$new(list(
+  ParamInt$new("num.trees", lower = 50, upper = 600)
+))
+
+atrf <- AutoTuner$new(
+  learner = learnerrf,
+  resampling = rsmp('cv', folds=3),
+  measure = measure,
+  search_space = tunentrees,
+  terminator = terminator,
+  tuner = tuner
+)
+
+atrf$train(task, row_ids = trainset)
+atrf$predict(task, row_ids = testset)$score() 
+```
+
+Use the function `set.seed()` for reproducible results. List all learners used.
+
+```{r}
+set.seed(1)
+
+lrnlist <- list(
+  glrnlr,
+  atplr,
+  glrngb,
+  learnertree,
+  atrf
+)
+```
+
+Establish benchmark design and run the comparisons.
+
+```{r}
+bmdesign <- benchmark_grid(task = task, resamplings = rsmp('cv', folds = 3), 
+                            learners = lrnlist)
+```
+
+```{r}
+bmr <- benchmark(bmdesign, store_models = T)
+```
+
+Visualize comparisons with box plots
+
+```{r}
+learners <- c("Logistic Regression",  "Penalised Logistic Regression", "Gradient Boosting", "Classification Trees", "Random Forest")
+autoplot(bmr) + 
+  labs(title = "Classification Error for Classification Models", 
+       x = "Classification Models",
+       y = "Classification Error") +  scale_x_discrete(labels= learners) + 
+  guides(x = guide_axis(angle = 45)) +
+  theme_generalplot() 
+```
+
+Overall measure for each classification model
+
+```{r}
+bmr$aggregate(measure)
+```
